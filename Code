@@ -1,0 +1,259 @@
+import cv2
+import numpy as np
+from PIL import Image, ImageTk
+import customtkinter as ctk
+import tkinter as tk
+from tkinter import filedialog, messagebox
+import speech_recognition as sr
+import threading
+import os
+import pyttsx3
+from fuzzywuzzy import process
+
+# ---------------- NLP Processor ----------------
+class NLPProcessor:
+    def __init__(self):
+        self.intent_map = {
+            "load_image": ["load", "open", "select image", "choose image", "upload picture", "open image"],
+            "save_image": ["save", "download", "store", "keep", "save image"],
+            "reset_app": ["reset", "clear", "start over", "restart", "refresh", "clear everything"],
+            "exit_app": ["exit", "close", "quit", "shutdown", "terminate", "end", "close app"],
+            "stop_voice": ["turn off", "stop listening", "thank you for your service", "stop", "disable voice"]
+        }
+
+    def get_intent(self, user_input):
+        user_input = user_input.lower()
+
+        best_match = None
+        best_score = 0
+
+        for intent, keywords in self.intent_map.items():
+            # Get the best match for user input from the keywords using fuzzywuzzy
+            match, score = process.extractOne(user_input, keywords)
+
+            # If the match score is above a certain threshold, consider it a valid match
+            if score > best_score:
+                best_match = intent
+                best_score = score
+
+        # Return the intent if a valid match is found, otherwise return "unknown"
+        return best_match if best_score >= 60 else "unknown"
+
+
+# ------------- Image Processing Logic -------------
+def generate_vector_edges(gray_image):
+    edges = cv2.Canny(gray_image, 100, 200)
+    dilated = cv2.dilate(edges, np.ones((1, 1), np.uint8), iterations=1)
+    _, thresholded = cv2.threshold(dilated, 127, 255, cv2.THRESH_BINARY)
+    inverted = 255 - thresholded
+    return cv2.cvtColor(inverted, cv2.COLOR_GRAY2BGR)
+
+def apply_vector_style(image):
+    smoothed = cv2.bilateralFilter(image, d=9, sigmaColor=75, sigmaSpace=75)
+    data = smoothed.reshape((-1, 3)).astype(np.float32)
+    K = 6
+    criteria = (cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_MAX_ITER, 30, 1.0)
+    _, labels, centers = cv2.kmeans(data, K, None, criteria, 10, cv2.KMEANS_RANDOM_CENTERS)
+    centers = np.uint8(centers)
+    clustered = centers[labels.flatten()].reshape(smoothed.shape)
+    gray = cv2.cvtColor(smoothed, cv2.COLOR_BGR2GRAY)
+    edges = generate_vector_edges(gray)
+    base = clustered.astype(np.float32) / 255.0
+    lines = edges.astype(np.float32) / 255.0
+    merged = np.clip(base * lines * 255, 0, 255).astype(np.uint8)
+    sharpen_kernel = np.array([[0, -1, 0], [-1, 5, -1], [0, -1, 0]])
+    sharpened = cv2.filter2D(merged, -1, sharpen_kernel)
+    return cv2.convertScaleAbs(sharpened, alpha=1.2, beta=0)
+
+
+# ------------- Main App ----------------
+class VectorArtStudio(ctk.CTk):
+    def __init__(self):
+        super().__init__()
+        self.title("🎨 Vector Art Studio")
+        self.state("zoomed")
+        self.resizable(True, True)
+
+        ctk.set_appearance_mode("dark")
+        ctk.set_default_color_theme("dark-blue")
+
+        self.original_image = None
+        self.processed_image = None
+        self.voice_thread_running = True
+        self.animation_text = "✨ Welcome to Vector Art Studio ✨"
+        self.animation_index = 0
+        self.engine = pyttsx3.init()
+        self.engine.setProperty('rate', 150)
+        self.engine.setProperty('volume', 1)
+
+        self.nlp = NLPProcessor()
+
+        self.splash_label = ctk.CTkLabel(self, text="", font=("Segoe UI", 40, "bold"), text_color="#00ffff")
+        self.splash_label.place(relx=0.5, rely=0.5, anchor="center")
+
+        self.animate_welcome_text()
+
+    def animate_welcome_text(self):
+        if self.animation_index <= len(self.animation_text):
+            self.splash_label.configure(text=self.animation_text[:self.animation_index])
+            self.animation_index += 1
+            self.after(80, self.animate_welcome_text)
+        else:
+            self.after(1000, self.load_interface)
+
+    def load_interface(self):
+        self.splash_label.destroy()
+        self.build_main_interface()
+
+    def build_main_interface(self):
+        self.grid_rowconfigure(2, weight=1)
+        self.grid_columnconfigure(0, weight=1)
+
+        button_frame = ctk.CTkFrame(self, corner_radius=15)
+        button_frame.grid(row=0, column=0, pady=20)
+
+        btn_config = {"font": ("Segoe UI", 14, "bold"), "corner_radius": 10}
+        ctk.CTkButton(button_frame, text="📁 Select Image", command=self.load_image, **btn_config).pack(side="left", padx=10)
+        self.save_button = ctk.CTkButton(button_frame, text="💾 Save", command=self.save_processed_image, state="disabled", **btn_config)
+        self.save_button.pack(side="left", padx=10)
+        self.reset_button = ctk.CTkButton(button_frame, text="🗑 Reset", command=self.reset_application, state="disabled", **btn_config)
+        self.reset_button.pack(side="left", padx=10)
+        ctk.CTkButton(button_frame, text="🎤 Voice", command=lambda: threading.Thread(target=self.listen_for_voice_commands, daemon=True).start(), **btn_config).pack(side="left", padx=10)
+
+        self.status_label = ctk.CTkLabel(self, text="Start by selecting an image or using your voice 🎤", font=("Segoe UI", 16), text_color="#CCCCCC")
+        self.status_label.grid(row=1, column=0, pady=10)
+
+        self.image_panel = ctk.CTkFrame(self, corner_radius=15)
+        self.image_panel.grid(row=2, column=0, padx=20, pady=10, sticky="nsew")
+        self.image_panel.columnconfigure((0, 1), weight=1)
+        self.image_panel.rowconfigure(1, weight=1)
+
+        ctk.CTkLabel(self.image_panel, text="📸 Original", font=("Segoe UI", 18, "bold"), text_color="#00ccff").grid(row=0, column=0, pady=(10, 5))
+        ctk.CTkLabel(self.image_panel, text="🧠 Vector Art", font=("Segoe UI", 18, "bold"), text_color="#00ff99").grid(row=0, column=1, pady=(10, 5))
+
+        self.original_label = ctk.CTkLabel(self.image_panel, text="")
+        self.original_label.grid(row=1, column=0, padx=10, pady=10, sticky="nsew")
+        self.vector_label = ctk.CTkLabel(self.image_panel, text="")
+        self.vector_label.grid(row=1, column=1, padx=10, pady=10, sticky="nsew")
+
+    def listen_for_voice_commands(self):
+        recognizer = sr.Recognizer()
+        mic = sr.Microphone()
+        with mic as source:
+            recognizer.adjust_for_ambient_noise(source)
+
+        self.speak("Voice mode is now active. How can I assist you?")
+        self.status_label.configure(text="🎤 Listening for command...")
+
+        while self.voice_thread_running:
+            try:
+                with mic as source:
+                    audio = recognizer.listen(source, timeout=5)
+                command = recognizer.recognize_google(audio).lower()
+                print(f"Voice Command: {command}")
+
+                intent = self.nlp.get_intent(command)
+
+                if intent == "stop_voice":
+                    self.speak("Turning off voice mode. Goodbye.")
+                    self.status_label.configure(text="🎤 Voice mode turned off.")
+                    break
+                elif intent == "load_image":
+                    self.load_image()
+                    self.speak("Image loading initiated.")
+                elif intent == "save_image":
+                    self.save_processed_image()
+                    self.speak("Saving your image.")
+                elif intent == "reset_app":
+                    self.reset_application()
+                    self.speak("Application reset.")
+                elif intent == "exit_app":
+                    self.status_label.configure(text="👋 Exiting application...")
+                    self.speak("Goodbye.")
+                    self.voice_thread_running = False
+                    self.quit()
+                else:
+                    self.status_label.configure(text=f"❓ Unknown command: '{command}'")
+                    self.speak("I didn't understand that. Please try again.")
+            except sr.WaitTimeoutError:
+                self.status_label.configure(text="⚠ Listening timeout. Try again.")
+                self.speak("Listening timeout. Try again.")
+            except Exception as e:
+                self.status_label.configure(text=f"⚠ Error: {e}")
+                self.speak(f"Error: {e}")
+
+    def speak(self, text):
+        self.engine.say(text)
+        self.engine.runAndWait()
+
+    def load_image(self):
+        file_path = filedialog.askopenfilename(filetypes=[("Image Files", "*.jpg *.jpeg *.png *.bmp")])
+        if not file_path:
+            return
+        try:
+            image = cv2.imread(file_path)
+            if image is None:
+                raise ValueError("The selected file is not a valid image.")
+            self.status_label.configure(text="Processing... please wait ⏳")
+            self.speak("Processing image, please wait.")
+            self.original_image = image
+            self.processed_image = apply_vector_style(image)
+            self.display_images()
+            self.status_label.configure(text="✅ Image processed successfully.")
+            self.speak("Image processed successfully.")
+            self.save_button.configure(state="normal")
+            self.reset_button.configure(state="normal")
+        except Exception as e:
+            messagebox.showerror("Processing Error", str(e))
+            self.status_label.configure(text="❌ Failed to process image.")
+            self.speak("Failed to process image.")
+
+    def display_images(self):
+        def convert_to_tk(img, max_w, max_h):
+            img_h, img_w = img.shape[:2]
+            scale = min(max_w / img_w, max_h / img_h)
+            resized = cv2.resize(img, (int(img_w * scale), int(img_h * scale)), interpolation=cv2.INTER_AREA)
+            return ImageTk.PhotoImage(Image.fromarray(cv2.cvtColor(resized, cv2.COLOR_BGR2RGB)))
+
+        self.update_idletasks()
+        panel_w = self.image_panel.winfo_width() // 2
+        panel_h = self.image_panel.winfo_height()
+
+        original_tk = convert_to_tk(self.original_image, panel_w, panel_h)
+        vector_tk = convert_to_tk(self.processed_image, panel_w, panel_h)
+
+        self.original_label.configure(image=original_tk)
+        self.original_label.image = original_tk
+        self.vector_label.configure(image=vector_tk)
+        self.vector_label.image = vector_tk
+
+    def save_processed_image(self):
+        if self.processed_image is None:
+            return
+        save_path = filedialog.asksaveasfilename(defaultextension=".png",
+                                                 filetypes=[("PNG", ".png"), ("JPEG", ".jpg"), ("BMP", "*.bmp")])
+        if save_path:
+            try:
+                cv2.imwrite(save_path, self.processed_image)
+                messagebox.showinfo("Success", "✅ Image saved successfully!")
+                self.speak("Image saved successfully.")
+            except Exception as e:
+                messagebox.showerror("Save Error", str(e))
+                self.speak("Failed to save image.")
+
+    def reset_application(self):
+        self.original_label.configure(image=None)
+        self.original_label.image = None
+        self.vector_label.configure(image=None)
+        self.vector_label.image = None
+        self.original_image = None
+        self.processed_image = None
+        self.status_label.configure(text="Ready for a new image 🖼")
+        self.speak("Ready for a new image.")
+        self.save_button.configure(state="disabled")
+        self.reset_button.configure(state="disabled")
+
+
+if __name__ == "__main__":
+    app = VectorArtStudio()
+    app.mainloop()
